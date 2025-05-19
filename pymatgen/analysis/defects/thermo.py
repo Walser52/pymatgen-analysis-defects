@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from monty.serialization import dumpfn
+
 import collections
 import logging
 from dataclasses import dataclass, field
@@ -29,6 +31,58 @@ from pyrho.charge_density import get_volumetric_like_sc
 from scipy.constants import value as _cd
 from scipy.optimize import bisect
 from scipy.spatial import ConvexHull
+
+from pymatgen.io.espresso.outputs import PWxml
+
+
+
+def fileread(func):
+    def wrapper(cls, xml_file, *args, **kwargs):
+        calc = PWxml(xml_file)
+        struct = calc.get_computed_entry(entry_id = "")
+
+        return func(cls, struct, *args, **kwargs)
+    return wrapper
+    
+
+class QECalcTools:
+    
+    @classmethod
+    @fileread
+    def standardize_total_energy(cls, struct):
+        e_bulk = struct.energy
+        composition = struct.composition
+        
+        comp_dict = composition.as_data_dict()['unit_cell_composition']
+        
+        elements = comp_dict.keys()
+        n_i = np.array(list(comp_dict.values()))
+        u_i = np.array([get_element_formation_energy(elem) for elem in elements])
+        
+        std_form_energy = (e_bulk - np.sum(n_i*u_i))/np.sum(n_i)
+
+        return std_form_energy
+    
+    @classmethod
+    def standardized_computed_entry(cls, xml_file):
+        """
+        Return a computed entry with the standard formation enthalpy as total energy
+        """
+        calc = PWxml(xml_file)
+        struct = calc.get_computed_entry(entry_id = "")
+
+        d_ = {
+           "energy": cls.standardize_total_energy(xml_file),
+           "composition": struct.composition,
+           "entry_id": "",
+           "correction": 0, 
+        }
+        
+        ent = ComputedEntry.from_dict(d_) 
+
+        return ent
+
+
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Sequence
@@ -167,7 +221,6 @@ class DefectEntry(MSONable):
                 up_sample=2,
             )
             bulk_locpot = bulk_sc_locpot
-
         frey_corr = get_freysoldt_correction(
             q=self.charge_state,
             dielectric=dielectric,
@@ -265,6 +318,7 @@ class FormationEnergyDiagram(MSONable):
     bulk_entry: ComputedStructureEntry | None = None
     inc_inf_values: bool = False
     bulk_stability: float = 0.001
+    standardize: str | None = None
 
     def __post_init__(self) -> None:
         """Post-initialization.
@@ -282,6 +336,7 @@ class FormationEnergyDiagram(MSONable):
             raise ValueError(
                 msg,
             )
+
         # if all of the `DefectEntry` objects have the same `bulk_entry` then `self.bulk_entry` is not needed
         if self.bulk_entry is None and any(
             x.bulk_entry is None for x in self.defect_entries
@@ -295,21 +350,42 @@ class FormationEnergyDiagram(MSONable):
             [x.bulk_entry for x in self.defect_entries],
             key=lambda x: x.energy_per_atom,
         )
+
+
+        #=======Create PD of stable entries+bulk out of all the entries given (ensure bulk stability)
         pd_ = PhaseDiagram(self.pd_entries)
+
+
+
         entries = pd_.stable_entries | {bulk_entry}
+
+
         pd_ = PhaseDiagram(entries)
+
         self.phase_diagram = ensure_stable_bulk(pd_, bulk_entry, self.bulk_stability)
+        #_______________________________________________________________________
+
+        #==========Find energy/composition to create a bare minimum list of computed entries=====
         entries = []
         for entry in self.phase_diagram.stable_entries:
+
             d_ = {
                 "energy": self.phase_diagram.get_form_energy(entry),
                 "composition": entry.composition,
                 "entry_id": entry.entry_id,
-                "correction": 0.0,
+                "correction": entry.correction,
             }
-            entries.append(ComputedEntry.from_dict(d_))
-            entries.append(ComputedEntry.from_dict(d_))
-        self.chempot_diagram = ChemicalPotentialDiagram(entries)
+            if np.abs(d_["energy"]) > 1000: 
+              continue
+
+            entries.append(ComputedEntry.from_dict(d_)) #Computed entries list. Why twice?
+            #entries.append(ComputedEntry.from_dict(d_))
+
+
+         #============Create a chempot diagram from the pared down list of compute entries `entries`.
+        self.chempot_diagram = ChemicalPotentialDiagram(entries, default_min_limit = -5900)
+
+       
         if (
             bulk_entry.composition.reduced_formula not in self.chempot_diagram.domains
         ):  # pragma: no cover
@@ -399,6 +475,108 @@ class FormationEnergyDiagram(MSONable):
             vbm=vbm,
             **kwargs,
         )
+
+    @classmethod
+    def with_directories_espresso(
+        cls,
+        directory_map: dict[str, str | Path],
+        defect: Defect,
+        pd_entries: list[ComputedEntry],
+        dielectric: float | NDArray,
+        vbm: float | None = None,
+        standardize: str | None = None,
+        **kwargs,
+    ) -> FormationEnergyDiagram:
+        """Create a FormationEnergyDiagram from VASP directories.
+
+        Args:
+            directory_map: A dictionary mapping the defect name to the directory containing the
+                VASP calculation.
+            defect: The defect used to create the defect entries.
+            pd_entries: The list of entries used to construct the phase diagram and chemical
+                potential diagram. They will be used to determine the stability region
+                of the bulk crystal.
+            dielectric: The dielectric constant of the bulk crystal.
+            vbm: The VBM of the bulk crystal.
+            standardize: None to use value as is. 'pbe', 'pbesol' etc. to standardize w.r.t. formation energies.
+
+            **kwargs: Additional keyword arguments for the constructor.
+        """
+        def get_file(directory: str | Path, ends_with: str = '.cube') -> Path:
+            """
+            Returns the first file in the directory that ends with the given suffix.
+            
+            Parameters:
+                directory (str | Path): The directory to search in.
+                ends_with (str): The file suffix to look for (default: '.cube').
+            Returns:
+                Path: Path to the first matching file.
+            Raises:
+                FileNotFoundError: If no matching file is found.
+            """
+            directory = Path(directory)
+            for file in directory.iterdir():
+                if file.is_file() and file.name.lower().endswith(ends_with.lower()):
+                    return file
+
+            msg = f"Could not find a file ending with '{ends_with}' in '{directory}'."
+            raise FileNotFoundError(msg)
+            return
+
+
+        def _read_dir(directory: str | Path, standardize: str | None = None) -> tuple[ComputedEntry, Locpot]:
+            """
+            Espresso file read. 
+            """
+            directory = Path(directory)
+            xml_file = get_file(directory, ".xml")
+
+            if standardize:
+              ent = QECalcTools.standardized_computed_entry(xml_file) 
+            else:
+              vr = PWxml(xml_file)
+              ent = vr.get_computed_entry(entry_id = "")
+            locpot = VolumetricData.from_cube(get_file(directory, "cube"))
+
+            return ent, locpot
+
+        if "bulk" not in directory_map:
+            msg = "The bulk directory must be provided."
+            raise ValueError(msg)
+        bulk_entry, bulk_locpot = _read_dir(directory_map["bulk"], standardize = standardize)
+
+        def_entries = []
+        for qq, q_dir in directory_map.items():
+            if qq == "bulk":
+                continue
+            q_entry, q_locpot = _read_dir(q_dir, standardize = standardize)
+
+            q_d_entry = DefectEntry(
+                defect=defect,
+                charge_state=int(qq),
+                sc_entry=q_entry,
+            )
+
+            q_d_entry.get_freysoldt_correction(
+                defect_locpot=q_locpot,
+                bulk_locpot=bulk_locpot,
+                dielectric=dielectric,
+            )
+            def_entries.append(q_d_entry)
+        if vbm is None:
+             vr = PWxml(get_file(directory_map["bulk"], ".xml"))
+             vbm = vr.vbm
+             print(vbm)
+        return cls(
+            bulk_entry=bulk_entry,
+            defect_entries=def_entries,
+            pd_entries=pd_entries,
+            vbm=vbm,
+            standardize=standardize,
+            **kwargs,
+        )
+
+
 
     @classmethod
     def with_directories(
